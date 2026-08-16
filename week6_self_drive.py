@@ -59,15 +59,23 @@ import sys
 try:
     import rclpy
     from rclpy.node import Node
-    from rclpy.qos import QoSProfile, qos_profile_sensor_data
+    from rclpy.qos import qos_profile_sensor_data
     from geometry_msgs.msg import Twist, PoseWithCovarianceStamped
-    from nav_msgs.msg import Odometry
-    from sensor_msgs.msg import LaserScan
+    from sensor_msgs.msg import LaserScan, Image
 except ImportError as exc:
     print("Missing a ROS module. Run inside the sourced MentorPi ROS 2 container.", file=sys.stderr)
     print(f"Import error: {exc}", file=sys.stderr)
     raise SystemExit(2) from exc
 
+
+try:
+    import cv2
+    from cv_bridge import CvBridge
+
+except ImportError as exc:
+    print("NumPy / SciPy not installed. Install SciPy and NumPy inside the sourced MentorPi ROS2 container", file=sys.stderr)
+    print(f"Import error: {exc}", file=sys.stderr)
+    raise SystemExit(2) from exc
 
 try:
     import numpy as np
@@ -88,16 +96,56 @@ def clip(v, lo, hi):
 def wrap(a):
     return math.atan2(math.sin(a), math.cos(a))
 
+def parse_triplet(text):
+    """Parse a command-line triplet such as 35,60,40."""
 
-def parse_waypoints(text):
-    pts = []
-    for pair in text.split(";"):
-        pair = pair.strip()
-        if not pair:
-            continue
-        x, y = pair.split(",")
-        pts.append((float(x), float(y)))
-    return pts
+    try:
+        values = tuple(int(part.strip()) for part in text.split(","))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("use three integers, for example 35,60,40") from exc
+    if len(values) != 3:
+        raise argparse.ArgumentTypeError("use exactly three values separated by commas")
+    return values
+
+#Color Spaces info
+SPACE_INFO = {
+    "hsv": {
+        "labels": ("H", "S", "V"),
+        "minimum": (0, 0, 0),
+        "maximum": (179, 255, 255),
+        "code": cv2.COLOR_BGR2HSV,
+        "note": "HSV is usually the easiest first choice for colored objects.",
+    },
+    "rgb": {
+        "labels": ("R", "G", "B"),
+        "minimum": (0, 0, 0),
+        "maximum": (255, 255, 255),
+        "code": cv2.COLOR_BGR2RGB,
+        "note": "RGB is direct, but brightness changes move all channels.",
+    },
+    "lab": {
+        "labels": ("L", "a", "b"),
+        "minimum": (0, 0, 0),
+        "maximum": (255, 255, 255),
+        "code": cv2.COLOR_BGR2LAB,
+        "note": "Lab separates lightness from color-opponent channels.",
+    },
+    "ycrcb": {
+        "labels": ("Y", "Cr", "Cb"),
+        "minimum": (0, 0, 0),
+        "maximum": (255, 255, 255),
+        "code": cv2.COLOR_BGR2YCrCb,
+        "note": "YCrCb separates brightness from video-style chroma channels.",
+    },
+}
+
+SPACE_ALIASES = {
+    "hsv": "hsv",
+    "rgb": "rgb",
+    "lab": "lab",
+    "ycrcb": "ycrcb",
+    "ycbcr": "ycrcb",
+}
 
 #Ideal PID values: kp=3.0 ki=0.0 kd=0.02
 class PIDController():
@@ -168,21 +216,16 @@ class SelfDrive(Node):
     def __init__(self, args):
         super().__init__("week6_self_drive")
         self.args = args
-        self.waypoints = parse_waypoints(args.waypoints)
-        self.wi = 0
-        self.pose = None            # (x, y, yaw) in the start frame (0,0 facing +x at launch)
-        self.odom_twist = None
-        self.origin = None          # first odom pose; waypoints are relative to it
-        self.last_odom = None
-
-        self.log = [] if args.log_file else None
         self.stopping = False       # set by stop_robot(); blocks any further motion
         self.finished = False       # plan complete -> main loop exits cleanly
-        self.done_ticks = 0         # zero-velocity ticks held after the last waypoint
+        self.frames_seen = 0.0
+
+        self.lane_error_x = 0.0
+        self.forward_distance = float("inf") #Forward distance detected by LiDAR
 
         self.cmd_pub = self.create_publisher(Twist, args.cmd_vel_topic, 10)
-
-        self.create_subscriber()
+        self.create_subscription(Image, args.image_topic, self.on_image, qos_profile_sensor_data)
+        self.create_subscription(LaserScan, args.scan_topic, self.on_scan, qos_profile_sensor_data)
 
         kp, ki, kd = self.args.lin_pid
         self.speed_controller = PIDController(kp, ki, kd, dt=1/self.args.rate)
@@ -204,100 +247,41 @@ class SelfDrive(Node):
             self.get_logger().warn("DRIVE mode: the robot WILL move. Keep the area clear; hand on Ctrl+C.")
 
         self.timer = self.create_timer(1.0 / args.rate, self.control_step)
-    
+
+    def on_image(self, msg: Image):
+        frame = self.bridge.imgmsg_to_cv2(msg,desired_encoding="bgr8")
+
+        self.frames_seen += 1
+        converted = cv2.cvtColor(frame, SPACE_INFO[self.args.space]["code"])
+        mask = self.make_mask(converted)
+        if self.args.kernel_size > 1:
+            kernel = np.ones((self.args.kernel_size, self.args.kernel_size), np.uint8)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+        result, message = self.draw_result(frame, mask)
+        
+    def make_mask(self, converted):
+        mask = np.zeros(converted.shape[:2], dtype=np.uint8)
+        for color_range in self.args.ranges:
+            mask = cv2.bitwise_or(mask, cv2.inRange(converted, color_range.lower, color_range.upper))
+        return mask
+  
+    def on_scan(self, msg: LaserScan):
+        pass
+        
+
     def control_step(self):
-        twist = Twist()
-        if self.pose is None:
-            self.publish(twist, "no odometry yet -> stop")
-            return
-        age = (self.get_clock().now() - self.last_odom).nanoseconds / 1e9
-        if age > self.args.data_timeout:
-            self.publish(twist, f"odometry stale ({age:.1f}s) -> stop")
-            return
-
-        x, y, yaw = self.fused_pose if self.fused_pose is not None else self.pose
-        if self.log is not None:
-            time = self.get_clock().now().nanoseconds / 1e9
-
-            odom = self.pose        or (float("nan"), float("nan"), float("nan"))
-            icp = self.icp_pose     or (float("nan"), float("nan"), float("nan"))
-            fused = self.fused_pose or (float("nan"), float("nan"), float("nan"))
-
-            self.log.append((time,
-
-                odom[0], odom[1], odom[2],
-                icp[0], icp[1], icp[2],
-                fused[0], fused[1], fused[2]
-            ))
-
-        if self.wi >= len(self.waypoints):
-            # Hold zero for a second so the chassis definitely has the stop, then
-            # let main() fall out of its spin loop and save the log.
-            self.done_ticks += 1
-            self.publish(twist, "all waypoints reached -> stop")
-            if self.done_ticks >= int(self.args.rate):
-                self.finished = True
-            return
-
-        gx, gy = self.waypoints[self.wi]
-        dist = math.hypot(gx - x, gy - y)
-
-        if self.speed_controller.at_tolerance(dist):
-            self.get_logger().info(f"reached waypoint {self.wi} ({gx:.2f}, {gy:.2f})")
-            self.wi += 1
-            self.publish(twist, "waypoint reached")
-            return
-
-        herr = wrap(math.atan2(gy - y, gx - x) - yaw)
-        turn = -clip(self.turn_controller.calculate(herr), -self.args.max_turn, self.args.max_turn)
-        # slow the forward speed when badly mis-aimed (cos gate), like the twin
-        speed = clip(-self.speed_controller.calculate(dist), 0.0, self.args.max_speed) * max(0.0, math.cos(herr))
-
-        twist.linear.x = clip(speed, 0.0, self.args.max_speed)
-        twist.angular.z = clip(turn, -self.args.max_turn, self.args.max_turn)
-        self.publish(twist, f"-> wp {self.wi} ({gx:.2f},{gy:.2f}) dist={dist:.2f} herr={math.degrees(herr):+.0f}deg")
+        pass
 
     def publish(self, twist: Twist, note: str):
-        pose = self.fused_pose if self.fused_pose is not None else self.pose
-
-        p = "none" if pose is None else f"({pose[0]:+.2f},{pose[1]:+.2f}) yaw={math.degrees(pose[2]):+.0f}"
-        self.get_logger().info(f"pose={p} | {note} | v={twist.linear.x:+.3f} w={twist.angular.z:+.3f}")
+        self.get_logger().info(f"{note} | v={twist.linear.x:+.3f} w={twist.angular.z:+.3f}")
         if self.args.mode == "drive" and not self.stopping:
             self.cmd_pub.publish(twist)
         else:
             self.cmd_pub.publish(Twist())
 
-    def publish_scan_pose(self, x, y, yaw, timestamp, avg_error):
-
-        msg = PoseWithCovarianceStamped()
-
-        msg.header.stamp = timestamp.to_msg()
-        msg.header.frame_id = "odom"
-
-        msg.pose.pose.position.x = x
-        msg.pose.pose.position.y = y
-        msg.pose.pose.position.z = 0.0
-
-        msg.pose.pose.orientation.x = 0.0
-        msg.pose.pose.orientation.y = 0.0
-        msg.pose.pose.orientation.z = math.sin(yaw / 2.0)
-        msg.pose.pose.orientation.w = math.cos(yaw / 2.0)
-
-        #Guessed covariance values. Im a bit worried about how it will turn out
-        variance_xy = max(0.04, (3.0 * avg_error) ** 2)      # ~20 cm confidence interval
-        variance_yaw = max(math.radians(10.0) ** 2, ...)      # ~10 degree confidence interval
-
-        cov = [0.0] * 36
-
-        cov[0] = variance_xy      # x
-        cov[7] = variance_xy      # y
-        cov[35] = variance_yaw    # yaw
-
-        msg.pose.covariance = cov
-
-        self.scan_pub.publish(msg)
-
-
+    
     def stop_robot(self):
         # A single publish() here is not a reliable stop: destroy_node() and
         # rclpy.shutdown() can run before the DDS writer has actually flushed the
@@ -328,33 +312,10 @@ class SelfDrive(Node):
             except Exception:
                 pass
 
-    def save_log(self):
-        if not self.log:
-            return
-        try:
-            with open(self.args.log_file, "w") as f:
-                f.write(
-                    "time,"
-                    "odom_x,odom_y,odom_yaw,"
-                    "icp_x,icp_y,icp_yaw,"
-                    "fused_x,fused_y,fused_yaw\n"
-                )
-                for row in self.log:
-                    f.write(",".join(f"{v:.4f}" for v in row) + "\n")
-            self.get_logger().info(f"saved {len(self.log)} trajectory points to {self.args.log_file}")
-        except Exception as exc:
-            self.get_logger().error(f"could not save log: {exc}")
-
-
 def build_parser():
-    p = argparse.ArgumentParser(description="Week 5 bounded waypoint-following behavior.")
-    p.add_argument("--mode", choices=("report", "drive"), default="report",
-                   help="report = compute + print but DO NOT move (default); drive = move with bounded commands.")
-    p.add_argument("--waypoints", default="0.8,0.0; 0.8,0.8; 0.0,0.8; 0.0,0.0",
-                   help='Waypoints "x,y; x,y; ..." relative to the robot\'s pose at launch (start = 0,0 facing +x).')
-    p.add_argument("--absolute", action="store_true",
-                   help="Interpret waypoints in the raw odom frame instead of relative to the start pose.")
-    p.add_argument("--odom-topic", default="/odom", help="Odometry topic (nav_msgs/Odometry).")
+    p = argparse.ArgumentParser(description="Week 6 self drive capstone")
+ 
+    p.add_argument("--image-topic", default="/ascamera/camera_publisher/rgb0/image", help="RGB image topic.")
     p.add_argument("--scan-topic", default="/scan_raw", help="LD19 LaserScan topic (try /scan if /scan_raw is absent; confirm with ros2 topic list).")
     p.add_argument("--cmd-vel-topic", default="/controller/cmd_vel", help="Twist topic the MentorPi chassis listens to (verify with ros2 topic list).")
     p.add_argument("--tolerance", type=float, default=0.12, help="Distance to count a waypoint as reached (m).")
@@ -364,7 +325,12 @@ def build_parser():
     p.add_argument("--lin-pid", type=float, default=[3.0, 0.0, 0.02], nargs=3, help="PID error to forward speed.")
     p.add_argument("--data-timeout", type=float, default=0.6, help="Stop if no odometry for this many seconds.")
     p.add_argument("--rate", type=float, default=10.0, help="Control loop rate (Hz).")
-    p.add_argument("--log-file", default="", help="Optional CSV path to save the (x,y,yaw) trajectory for sim-vs-real comparison.")
+    p.add_argument("--space", type=canonical_space, default="hsv", help="hsv, rgb, lab, ycrcb, or ycbcr")
+    p.add_argument("--color-name", default="red", help="red, green, blue, or a custom label")
+    p.add_argument("--lower", type=parse_triplet, help="first lower threshold triplet")
+    p.add_argument("--upper", type=parse_triplet, help="first upper threshold triplet")
+    p.add_argument("--lower2", type=parse_triplet, help="optional second lower threshold triplet")
+    p.add_argument("--upper2", type=parse_triplet, help="optional second upper threshold triplet")
     return p
 
 
