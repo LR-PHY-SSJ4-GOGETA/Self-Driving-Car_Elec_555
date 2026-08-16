@@ -107,6 +107,15 @@ def parse_triplet(text):
         raise argparse.ArgumentTypeError("use exactly three values separated by commas")
     return values
 
+def canonical_space(text):
+    """Return the OpenCV space name used by this script."""
+
+    key = text.strip().lower()
+    if key not in SPACE_ALIASES:
+        choices = ", ".join(sorted(SPACE_ALIASES))
+        raise argparse.ArgumentTypeError(f"choose one color space: {choices}")
+    return SPACE_ALIASES[key]
+
 #Color Spaces info
 SPACE_INFO = {
     "hsv": {
@@ -218,7 +227,10 @@ class SelfDrive(Node):
         self.args = args
         self.stopping = False       # set by stop_robot(); blocks any further motion
         self.finished = False       # plan complete -> main loop exits cleanly
+
+        self.frame = 0.0
         self.frames_seen = 0.0
+        self.mask = 0.0
 
         self.lane_error_x = 0.0
         self.forward_distance = float("inf") #Forward distance detected by LiDAR
@@ -259,6 +271,7 @@ class SelfDrive(Node):
             mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
             mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
+        self.mask = mask
         result, message = self.draw_result(frame, mask)
         
     def make_mask(self, converted):
@@ -266,12 +279,75 @@ class SelfDrive(Node):
         for color_range in self.args.ranges:
             mask = cv2.bitwise_or(mask, cv2.inRange(converted, color_range.lower, color_range.upper))
         return mask
-  
+
+    def detect_lane(self):
+        h, w = self.mask.shape
+
+        # Only consider the bottom portion of the image.
+        roi_top = int(h * 0.45)
+
+        roi = np.zeros_like(self.mask)
+        roi[roi_top:, :] = self.mask[roi_top:, :]
+
+        contours, _ = cv2.findContours(roi, cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
+
+        # Remove tiny noise
+        contours = [
+            c for c in contours
+            if cv2.contourArea(c) > 100
+        ]
+
+        if not contours:
+            self.lane_error_x = None
+            return
+
+        # Assume the largest blue region is the tape
+        contour = max(contours, key=cv2.contourArea)
+
+        points = np.squeeze(contour)
+
+        # Fit a line to the tape
+        vx, vy, x0, y0 = cv2.fitLine(
+            points,
+            cv2.DIST_L2,
+            0,
+            0.01,
+            0.01
+        )
+
+        vx = float(vx)
+        vy = float(vy)
+        x0 = float(x0)
+        y0 = float(y0)
+
+        if abs(vy) < 1e-6:
+            self.lane_error_x = 0
+            return
+
+        # Look ahead into the image
+        lookahead_y = int(h * 0.75)
+
+        # x-coordinate of tape at lookahead_y
+        tape_x = x0 + (lookahead_y - y0) * (vx / vy)
+
+        # Normalize to approximately [-1, 1]
+        image_center = w / 2.0
+
+        self.lane_error_x = (tape_x - image_center) / image_center
+        
     def on_scan(self, msg: LaserScan):
         pass
         
 
     def control_step(self):
+
+        self.detect_lane()
+        turn = clip(self.turn_controller.calculate(-self.lane_error_x), -self.args.max_speed, self.args.max_speed)
+
+
+        velocity = Twist()
+        velocity.angular.z = turn
+        self.publish(velocity, "Lane Following")
         pass
 
     def publish(self, twist: Twist, note: str):
@@ -361,7 +437,7 @@ def main():
               f"{2.0 * step:.2f} m, or lower --max-speed.", file=sys.stderr)
 
     rclpy.init()
-    node = WaypointFollow(args)
+    node = SelfDrive(args)
     try:
         # Not rclpy.spin(): this loop lets the node end the run itself once the
         # plan is complete, so the trajectory log is saved without waiting for a
