@@ -107,54 +107,6 @@ def parse_triplet(text):
         raise argparse.ArgumentTypeError("use exactly three values separated by commas")
     return values
 
-def canonical_space(text):
-    """Return the OpenCV space name used by this script."""
-
-    key = text.strip().lower()
-    if key not in SPACE_ALIASES:
-        choices = ", ".join(sorted(SPACE_ALIASES))
-        raise argparse.ArgumentTypeError(f"choose one color space: {choices}")
-    return SPACE_ALIASES[key]
-
-#Color Spaces info
-SPACE_INFO = {
-    "hsv": {
-        "labels": ("H", "S", "V"),
-        "minimum": (0, 0, 0),
-        "maximum": (179, 255, 255),
-        "code": cv2.COLOR_BGR2HSV,
-        "note": "HSV is usually the easiest first choice for colored objects.",
-    },
-    "rgb": {
-        "labels": ("R", "G", "B"),
-        "minimum": (0, 0, 0),
-        "maximum": (255, 255, 255),
-        "code": cv2.COLOR_BGR2RGB,
-        "note": "RGB is direct, but brightness changes move all channels.",
-    },
-    "lab": {
-        "labels": ("L", "a", "b"),
-        "minimum": (0, 0, 0),
-        "maximum": (255, 255, 255),
-        "code": cv2.COLOR_BGR2LAB,
-        "note": "Lab separates lightness from color-opponent channels.",
-    },
-    "ycrcb": {
-        "labels": ("Y", "Cr", "Cb"),
-        "minimum": (0, 0, 0),
-        "maximum": (255, 255, 255),
-        "code": cv2.COLOR_BGR2YCrCb,
-        "note": "YCrCb separates brightness from video-style chroma channels.",
-    },
-}
-
-SPACE_ALIASES = {
-    "hsv": "hsv",
-    "rgb": "rgb",
-    "lab": "lab",
-    "ycrcb": "ycrcb",
-    "ycbcr": "ycrcb",
-}
 
 #Ideal PID values: kp=3.0 ki=0.0 kd=0.02
 class PIDController():
@@ -228,12 +180,16 @@ class SelfDrive(Node):
         self.stopping = False       # set by stop_robot(); blocks any further motion
         self.finished = False       # plan complete -> main loop exits cleanly
 
+        self.bridge = CvBridge()
+
         self.frame = 0.0
         self.frames_seen = 0.0
         self.mask = 0.0
 
         self.lane_error_x = 0.0
+        self.stop_error = (0, 0)
         self.forward_distance = float("inf") #Forward distance detected by LiDAR
+        self.last_data_time = 0.0
 
         self.cmd_pub = self.create_publisher(Twist, args.cmd_vel_topic, 10)
         self.create_subscription(Image, args.image_topic, self.on_image, qos_profile_sensor_data)
@@ -243,11 +199,13 @@ class SelfDrive(Node):
         self.speed_controller = PIDController(kp, ki, kd, dt=1/self.args.rate)
         self.speed_controller.set_setpoint(0.0)
         self.speed_controller.set_tolerance(self.args.tolerance)
+        self.speed_setpoint = self.args.max_speed #Makes code for PID so much easier. Can just use setpoints
 
         kp, ki, kd = self.args.ang_pid
         self.turn_controller = PIDController(kp, ki, kd, dt=1/self.args.rate)
         self.turn_controller.set_setpoint(0.0)
         self.turn_controller.set_tolerance(math.radians(3))
+        self.turn_setpoint = 0.0
 
         self.get_logger().info(
             f"MODE={args.mode.upper()}  waypoints={self.waypoints}  tol={args.tolerance:.2f} m  "
@@ -262,93 +220,120 @@ class SelfDrive(Node):
 
     def on_image(self, msg: Image):
         frame = self.bridge.imgmsg_to_cv2(msg,desired_encoding="bgr8")
-
         self.frames_seen += 1
-        converted = cv2.cvtColor(frame, SPACE_INFO[self.args.space]["code"])
-        mask = self.make_mask(converted)
-        if self.args.kernel_size > 1:
-            kernel = np.ones((self.args.kernel_size, self.args.kernel_size), np.uint8)
-            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-
-        self.mask = mask
-        result, message = self.draw_result(frame, mask)
+        self.lane_error_x = self.lane_error(frame)
         
-    def make_mask(self, converted):
-        mask = np.zeros(converted.shape[:2], dtype=np.uint8)
-        for color_range in self.args.ranges:
-            mask = cv2.bitwise_or(mask, cv2.inRange(converted, color_range.lower, color_range.upper))
-        return mask
+        stop_sign_error_x, stop_sign_error_y = self.detect_stop_sign(frame)
+        if (stop_sign_error_x is not None and stop_sign_error_y is not None):
+            self.stop_error = (stop_sign_error_x, stop_sign_error_x)
 
-    def detect_lane(self):
-        h, w = self.mask.shape
 
-        # Only consider the bottom portion of the image.
-        roi_top = int(h * 0.45)
+                
+    def lane_error(self, img):
+        h, w = img.shape[:2]
+        hsv = cv2.cvtColor(cv2.GaussianBlur(img,(5,5),0), cv2.COLOR_BGR2HSV)
+        roi = hsv[int(h * 0.6):, :]
+        band = cv2.inRange(roi,np.array(self.args.lower), np.array(self.args.upper))
 
-        roi = np.zeros_like(self.mask)
-        roi[roi_top:, :] = self.mask[roi_top:, :]
+        if self.args.lower2 is not None and self.args.upper2 is not None:
+            band2 = cv2.inRange(roi, np.array(self.args.lower2), np.array(self.args.upper2))
 
-        contours, _ = cv2.findContours(roi, cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
+            band = cv2.bitwise_or(band, band2)
+        # binaryImage=True makes m00 the PIXEL COUNT. Without it m00 sums 0/255
+        # values, so a gate of 500 is really "2 pixels" -- and the car would happily
+        # steer at a speck of yellow on the floor. Count pixels, not brightness.
+        M = cv2.moments(band, binaryImage=True)
+        if M["m00"] < self.args.min_lane_area: return None, None      # lane lost -> the car must stop
+        cx = M["m10"]/M["m00"]
+        return (cx - w/2)/(w/2)
 
-        # Remove tiny noise
-        contours = [
-            c for c in contours
-            if cv2.contourArea(c) > 100
-        ]
+    def detect_stop_sign(self, img):
 
-        if not contours:
-            self.lane_error_x = None
-            return
+        #Tune on real robot
+        lower_red1 = (0, 100, 80)
+        upper_red1 = (10, 255, 255)
 
-        # Assume the largest blue region is the tape
-        contour = max(contours, key=cv2.contourArea)
+        lower_red2 = (170, 100, 80)
+        upper_red2 = (179, 255, 255)
 
-        points = np.squeeze(contour)
+        hsv = cv2.cvtColor(cv2.GaussianBlur(img,(5,5),0), cv2.COLOR_BGR2HSV)
 
-        # Fit a line to the tape
-        vx, vy, x0, y0 = cv2.fitLine(
-            points,
-            cv2.DIST_L2,
-            0,
-            0.01,
-            0.01
-        )
+        red_mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
+        red_mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
 
-        vx = float(vx)
-        vy = float(vy)
-        x0 = float(x0)
-        y0 = float(y0)
+        red_mask = cv2.bitwise_or(red_mask1, red_mask2)
 
-        if abs(vy) < 1e-6:
-            self.lane_error_x = 0
-            return
+        contours, _ = cv2.findContours(red_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        # Look ahead into the image
-        lookahead_y = int(h * 0.75)
+        #Detect if red contour is an octagon
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area  < 500:
+                continue
+            perimeter = cv2.arcLength(contour, True)
+            approx = cv2.approxPolyDP(contour, 0.04 * perimeter, True)
 
-        # x-coordinate of tape at lookahead_y
-        tape_x = x0 + (lookahead_y - y0) * (vx / vy)
+            num_corners = len(approx)
 
-        # Normalize to approximately [-1, 1]
-        image_center = w / 2.0
-
-        self.lane_error_x = (tape_x - image_center) / image_center
+            #Around 8 corners for an octagon. Done to reduce slight errors
+            if 7 <= num_corners <= 9:
+                M = cv2.moments(contour)
         
+                if M["m00"] != 0:
+                    cx = int(M["m10"] / M["m00"])
+                    cy = int(M["m01"] / M["m00"])
+                    return (cx - w/2)/(w/2), (cy - h/2)/(h/2)
+
+        return None, None
+        
+    
     def on_scan(self, msg: LaserScan):
-        pass
+        ranges = np.asarray(msg.ranges, dtype=np.float32)
+        n = ranges.size
+        if n == 0:
+            return
+        angles = msg.angle_min + np.arange(n) * msg.angle_increment
+        # Keep only physically valid readings.
+        valid = (
+            np.isfinite(ranges)
+            & (ranges >= msg.range_min)
+            & (ranges <= msg.range_max)
+        )
+        half = math.radians(self.args.front_fov / 2.0)
+        # The LD19 publishes a full 360 deg scan; forward is angle 0 (REP-103
+        # x-forward). Wrap angles into [-pi, pi] so the forward window is around 0.
+        wrapped = np.arctan2(np.sin(angles), np.cos(angles))
+        front = valid & (np.abs(wrapped) <= half)
+
+        self.forward_distance = float(np.min(ranges[front])) if np.any(front) else math.inf
+        self.last_data_time = self.get_clock().now()
         
 
     def control_step(self):
+        # No lane
+        if self.lane_error_x is None:
+            self.publish(Twist(), "Lane Lost")
+            return
+        
+        # LiDAR safety
+        if self.front < self.args.stop_distance:
+            self.speed_setpoint = 0.0
+        else:
+            self.speed_setpoint = self.args.max_speed
+        
+        self.turn_setpoint = self.lane_error_x
 
-        self.detect_lane()
-        turn = clip(self.turn_controller.calculate(-self.lane_error_x), -self.args.max_speed, self.args.max_speed)
+        # Steering
+        turn = clip(self.turn_controller.calculate(self.turn_setpoint), -self.args.max_turn, self.args.max_turn)
 
+        # Forward speed
+        speed = clip(self.turn_controller.calculate(self.turn_setpoint), -self.args.max_turn, self.args.max_turn)
 
-        velocity = Twist()
-        velocity.angular.z = turn
-        self.publish(velocity, "Lane Following")
-        pass
+        cmd = Twist()
+        cmd.linear.x = speed
+        cmd.angular.z = turn
+
+        self.publish(cmd, "Lane Following")
 
     def publish(self, twist: Twist, note: str):
         self.get_logger().info(f"{note} | v={twist.linear.x:+.3f} w={twist.angular.z:+.3f}")
@@ -401,12 +386,13 @@ def build_parser():
     p.add_argument("--lin-pid", type=float, default=[3.0, 0.0, 0.02], nargs=3, help="PID error to forward speed.")
     p.add_argument("--data-timeout", type=float, default=0.6, help="Stop if no odometry for this many seconds.")
     p.add_argument("--rate", type=float, default=10.0, help="Control loop rate (Hz).")
-    p.add_argument("--space", type=canonical_space, default="hsv", help="hsv, rgb, lab, ycrcb, or ycbcr")
     p.add_argument("--color-name", default="red", help="red, green, blue, or a custom label")
     p.add_argument("--lower", type=parse_triplet, help="first lower threshold triplet")
     p.add_argument("--upper", type=parse_triplet, help="first upper threshold triplet")
     p.add_argument("--lower2", type=parse_triplet, help="optional second lower threshold triplet")
     p.add_argument("--upper2", type=parse_triplet, help="optional second upper threshold triplet")
+    p.add_argument("--min-line-area", type=float, default=200, help="Minimum area seen for the lane")
+    p.add_argument("--front-fov", type=float, default=30, help="Front FOV for lidar to look ahead")
     return p
 
 
