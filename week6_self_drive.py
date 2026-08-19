@@ -188,6 +188,8 @@ class SelfDrive(Node):
 
         self.lane_error_x = 0.0
         self.stop_error = (0, 0)
+        self.light_error = (0, 0)
+        self.light_color = "UNKNOWN"
         self.forward_distance = float("inf") #Forward distance detected by LiDAR
         self.last_data_time = 0.0
 
@@ -223,9 +225,14 @@ class SelfDrive(Node):
         self.frames_seen += 1
         self.lane_error_x = self.lane_error(frame)
         
-        stop_sign_error_x, stop_sign_error_y = self.detect_stop_sign(frame)
-        if (stop_sign_error_x is not None and stop_sign_error_y is not None):
-            self.stop_error = (stop_sign_error_x, stop_sign_error_x)
+        if error_coords := self.detect_stop_sign(frame):
+            if error_coords[0] is not None:  # Only checks the first element
+                self.stop_error = (error_coords[0], error_coords[1])
+
+        if error_coords := self.detect_traffic_light(frame):
+            if error_coords[0] is not None:  # Only checks the first element
+                self.light_error = (error_coords[0], error_coords[1])
+                self.light_color = error_coords[3]
 
 
                 
@@ -248,6 +255,8 @@ class SelfDrive(Node):
         return (cx - w/2)/(w/2)
 
     def detect_stop_sign(self, img):
+
+        h, w = img.shape[:2]
 
         #Tune on real robot
         lower_red1 = (0, 100, 80)
@@ -285,6 +294,74 @@ class SelfDrive(Node):
                     return (cx - w/2)/(w/2), (cy - h/2)/(h/2)
 
         return None, None
+
+    def detect_traffic_light(self, img):
+
+            h, w = img.shape[:2]
+    
+            #Tune on real robot
+            lower_red1 = (0, 100, 80)
+            upper_red1 = (10, 255, 255)
+    
+            lower_red2 = (170, 100, 80)
+            upper_red2 = (179, 255, 255)
+
+            lower_green = (0, 0, 0)
+            upper_green = (0, 0, 0)
+
+            # Convert to HSV format
+            hsv = cv2.cvtColor(cv2.GaussianBlur(img,(5,5),0), cv2.COLOR_BGR2HSV)
+
+            #Create red and green masks then fise them
+            red_mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
+            red_mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
+
+            green_mask = cv2.inRange(hsv, lower_green, upper_green)
+            red_mask = cv2.bitwise_or(red_mask1, red_mask2)
+
+            full_mask = cv2.bitwise_or(red_mask, green_mask)
+
+            # Get the contours
+            contours, _ = cv2.findContours(full_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+            #Detect if red contour is a circle or near-circular ellipse
+            for contour in contours:
+                area = cv2.contourArea(contour)
+                if area  < 50:
+                    continue
+
+                perimeter = cv2.arcLength(contour, True)
+
+                circularity = (4 * np.pi * area) / perimeter ** 2
+    
+                #If contour is around circular
+                if 0.85 <= circularity <= 1.2:
+
+                    #Determine color of mask
+                    contour_mask = np.zeros(img.shape[:2], dtype=np.uint8)
+                    mean_hsv = cv2.mean(hsv, mask=contour_mask)
+                    mean_hue = mean_hsv[0]
+
+                    # Classify color based on Hue channel (OpenCV Hue is 0-179)
+                    # Red wraps around 0 and 180
+                    if mean_hue < 12 or mean_hue > 165:
+                        color = "RED"
+                    # Green is typically between 35 and 85
+                    elif 35 <= mean_hue <= 85:
+                        color = "GREEN"
+                    else:
+                        color = "UNKNOWN"
+
+                    # Get error_x and error_y
+                    M = cv2.moments(contour)
+            
+                    if M["m00"] != 0:
+                        cx = int(M["m10"] / M["m00"])
+                        cy = int(M["m01"] / M["m00"])
+
+                        return (cx - w/2)/(w/2), (cy - h/2)/(h/2), color
+    
+            return None, None, None
         
     
     def on_scan(self, msg: LaserScan):
