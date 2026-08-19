@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
 """ROS 2 self-driving behavior for ELEC 555 Week 6.
 
-Lane following, stop sign detection, traffic light handling, and obstacle avoidance
-for the MentorPi chassis.
+Hybrid implementation combining:
+- Explicit state machine with clear priorities (from stock)
+- Stale data checking for safety (from stock)
+- Timestamp-based stop handling (from stock)
+- Robust shutdown with multiple stop attempts (from stock)
+- Speed slowed during sharp turns (from stock)
+- Accurate distance estimation via camera calibration (from your code)
+- Differentiated stop sign and traffic light detection (from your code)
+- PID control for smoother steering and speed (from your code)
 """
 
 import argparse
@@ -103,32 +110,32 @@ class SelfDrive(Node):
 
         self.bridge = CvBridge()
 
+        # Perception data
         self.frames_seen = 0
         self.lane_error_x = None    # Initialized as None until a lane is detected
+        self.last_image = None
+        self.last_scan = None
 
-        self.can_stop = True
-        self.last_stop_time = 0.0
-        self.stop_cooldown = 2.0
+        # Stop sign data (with physical distances)
         self.stop_dist = (None, None)
         self.stop_error = (None, None)
+        self.stop_until = None      # Timestamp when stop should end
+        self.ignore_cue_until = None # Timestamp when we can start detecting again
 
+        # Traffic light data
         self.light_dist = (None, None)
         self.light_error = (None, None)
         self.light_color = "UNKNOWN"
 
-        self.forward_distance = float("inf") # LiDAR front obstacle distance
-        self.last_data_time = self.get_clock().now()
+        self.forward_distance = float("inf")  # LiDAR front obstacle distance
 
-        self.stop_until = 0.0
-        self.stop_sign_stopped = False
+        # Physical dimensions for distance estimation, in meters
+        self.stop_sign_w = 0.12      
+        self.stop_sign_h = 0.12       
+        self.traffic_light_w = 0.06   
+        self.traffic_light_h = 0.06  
 
-        self.stop_sign_w = 0.12       # meters
-        self.stop_sign_h = 0.12       # meters
-
-        self.traffic_light_w = 0.06   # meters
-        self.traffic_light_h = 0.06   # meters
-
-        # ROS 2 Subscriptions & Publishers
+        # Publishers and Subscribers
         self.cmd_pub = self.create_publisher(Twist, args.cmd_vel_topic, 10)
         self.create_subscription(Image, args.image_topic, self.on_image, qos_profile_sensor_data)
         self.create_subscription(LaserScan, args.scan_topic, self.on_scan, qos_profile_sensor_data)
@@ -157,13 +164,17 @@ class SelfDrive(Node):
 
         self.timer = self.create_timer(1.0 / args.rate, self.control_step)
 
+    
+    def fresh(self, stamp):
+        """Check if sensor data is fresh enough to trust."""
+        return stamp is not None and (self.get_clock().now() - stamp).nanoseconds / 1e9 <= self.args.data_timeout
+
     def on_image(self, msg: Image):
         frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
         self.frames_seen += 1
         self.lane_error_x = self.lane_error(frame)
         
         stop_data = self.detect_stop_sign(frame)
-
         if stop_data[0] is not None:
             self.stop_dist = (stop_data[0], stop_data[1])
             self.stop_error = (stop_data[2], stop_data[3])
@@ -172,7 +183,6 @@ class SelfDrive(Node):
             self.stop_error = (None, None)
 
         light_data = self.detect_traffic_light(frame)
-
         if light_data[0] is not None:
             self.light_dist = (light_data[0], light_data[1])
             self.light_error = (light_data[2], light_data[3])
@@ -181,6 +191,8 @@ class SelfDrive(Node):
             self.light_dist = (None, None)
             self.light_error = (None, None)
             self.light_color = "UNKNOWN"
+
+        self.last_image = self.get_clock().now()
 
     def lane_error(self, img):
         h, w = img.shape[:2]
@@ -309,69 +321,110 @@ class SelfDrive(Node):
         front = valid & (np.abs(wrapped) <= half)
 
         self.forward_distance = float(np.min(ranges[front])) if np.any(front) else math.inf
-        self.last_data_time = self.get_clock().now()
+        self.last_scan = self.get_clock().now()
 
+    
     def control_step(self):
-        now = self.get_clock().now().nanoseconds / 1e9
+        now = self.get_clock().now()
+        twist = Twist()
 
-        # LiDAR check
+        # Safety Check 1: Missing or stale sensor data -> STOP
+        if not self.fresh(self.last_image) or not self.fresh(self.last_scan):
+            return self.publish(twist, "STOP", "no fresh camera/scan")
+
+        # 1) AVOID: obstacle in the safety bubble beats everything.
         if self.forward_distance <= self.args.stop_distance:
-            self.publish(Twist(), "Obstacle in the way")
-            return
+            return self.publish(twist, "AVOID", f"obstacle {self.forward_distance:.2f} m")
 
-        # Traffic light check
-        if self.light_color == "RED" and self.light_dist[0] is not None and self.light_dist[0] <= self.args.stop_distance:
-            self.publish(Twist(), "Red Light")
-            return
+        # 2) STOP: a rule cue (red light / stop sign), held for a moment, then ignored so we can leave.
+        # Check if we're currently holding at a stop
+        holding = self.stop_until is not None and now.nanoseconds < self.stop_until
+        ignoring = self.ignore_cue_until is not None and now.nanoseconds < self.ignore_cue_until
 
-        if now - self.last_stop_time >= self.stop_cooldown and not self.can_stop:
-            self.can_stop = True
+        # Check for red light
+        red_light_detected = (
+            self.light_color == "RED" 
+            and self.light_dist[0] is not None 
+            and self.light_dist[0] <= self.args.stop_distance
+        )
 
-        # Stop sign check
-        if self.can_stop:
-            if self.stop_dist[0] is not None and self.stop_dist[0] <= self.args.stop_distance and not self.stop_sign_stopped:
-                self.stop_sign_stopped = True
-                self.last_stop_time = now
-                self.stop_until = now + self.args.stop_time
+        # Check for stop sign
+        stop_sign_detected = (
+            self.stop_dist[0] is not None 
+            and self.stop_dist[0] <= self.args.stop_distance
+        )
 
-            if self.stop_sign_stopped:
-                if now < self.stop_until:
-                    self.publish(Twist(), "Stop Sign")
-                    return
-                self.stop_sign_stopped = False
-                self.stop_dist = (None, None)
-                self.can_stop = False
+        stop_cue_detected = red_light_detected or stop_sign_detected
 
-        # Lane tracking check
+        if holding:
+            return self.publish(twist, "STOP", "holding at stop cue")
+
+        if stop_cue_detected and not ignoring:
+            # Start the stop timer
+            self.stop_until = now.nanoseconds + int(self.args.stop_hold * 1e9)
+            # Ignore the cue for a while after stopping so we can leave
+            self.ignore_cue_until = now.nanoseconds + int((self.args.stop_hold + self.args.stop_ignore) * 1e9)
+            return self.publish(twist, "STOP", "stop cue detected")
+
+        # 3) DRIVE: follow the lane, slowing near obstacles and if the lane is faint.
+        # A lost lane is a STOP, not a DRIVE: the command is zero, so the state
+        # printed in the log has to say so. Logging "DRIVE" while the wheels are
+        # stopped makes your Measure-Your-Runs counts wrong.
         if self.lane_error_x is None:
-            self.publish(Twist(), "Lane Lost")
-            return
+            return self.publish(twist, "STOP", "lane lost")
 
-        turn = clip(self.turn_controller.calculate(-self.lane_error_x),-self.args.max_turn,self.args.max_turn)
-        speed = clip(self.speed_controller.calculate(self.args.stop_distance - clip(self.forward_distance, 0, 25)), -self.args.max_speed, self.args.max_speed)
+        # PID
+        turn = clip(
+            self.turn_controller.calculate(-self.lane_error_x),
+            -self.args.max_turn,
+            self.args.max_turn
+        )
 
-        cmd = Twist()
-        cmd.linear.x = speed
-        cmd.angular.z = turn
+        # PID Speed with slowing on sharp turns
+        base_speed = clip(
+            self.speed_controller.calculate(
+                self.args.stop_distance - clip(self.forward_distance, 0, 25)
+            ),
+            -self.args.max_speed,
+            self.args.max_speed
+        )
+        
+        # Slow down on sharp turns
+        speed = base_speed * (1.0 - min(1.0, abs(self.lane_error_x) * 0.5))
+        
+        # Extra caution zone slowing
+        if self.forward_distance <= self.args.slow_distance:
+            speed *= 0.4
 
-        self.publish(cmd, "Lane Following")
+        # Ensure we're not going backwards
+        speed = clip(speed, 0.0, self.args.max_speed)
 
-    def publish(self, twist: Twist, note: str):
+        twist.linear.x = speed
+        twist.angular.z = turn
+
+        self.publish(twist, "DRIVE", f"lane_err={self.lane_error_x:+.2f}")
+
+    def publish(self, twist: Twist, state: str, why: str):
+        """Publish with clear state logging."""
         lane_log = "none" if self.lane_error_x is None else f"{self.lane_error_x:+.3f}"
-
+        obs = "inf" if not math.isfinite(self.forward_distance) else f"{self.forward_distance:.2f}"
+        
         stop_detected = self.stop_dist[0] is not None
         stop_log = f"{self.stop_dist[0]:.2f}m" if stop_detected else "none"
 
         light_detected = self.light_dist[0] is not None
         light_log = f"{self.light_color} {self.light_dist[0]:.2f}m" if light_detected else "none"
 
+        holding = self.stop_until is not None
+        ignoring = self.ignore_cue_until is not None
+
         self.get_logger().info(
-            f"{note} | "
+            f"[{state}] {why} | "
             f"lane={lane_log} | "
-            f"stop_cue={stop_detected} | "
-            f"stop_dist={stop_log} | "
+            f"obs={obs} | "
+            f"stop={stop_log} | "
             f"light={light_log} | "
-            f"lidar_forward_dist={self.forward_distance:.2f}m | "
+            f"holding={holding} ignoring={ignoring} | "
             f"v={twist.linear.x:+.3f} w={twist.angular.z:+.3f}"
         )
 
@@ -380,7 +433,10 @@ class SelfDrive(Node):
         else:
             self.cmd_pub.publish(Twist())
 
+    # --- Robust Shutdown ----------------------------------------------------
+
     def stop_robot(self):
+        """Cancel timer and publish stop commands repeatedly for safety."""
         self.stopping = True
         try:
             self.timer.cancel()
@@ -396,7 +452,7 @@ class SelfDrive(Node):
 
 
 def build_parser():
-    p = argparse.ArgumentParser(description="Week 6 self drive capstone")
+    p = argparse.ArgumentParser(description="Week 6 self drive - Hybrid implementation")
     
     # System execution flags
     p.add_argument("--mode", choices=("report", "drive"), default="report", help="report = compute/print only; drive = move robot.")
@@ -411,27 +467,31 @@ def build_parser():
     p.add_argument("--ang-pid", type=float, default=[1.0, 0.0, 0.0], nargs=3, help="PID error to turn rate.")
     p.add_argument("--lin-pid", type=float, default=[3.0, 0.0, 0.02], nargs=3, help="PID error to forward speed.")
     p.add_argument("--rate", type=float, default=10.0, help="Control loop rate (Hz).")
-    p.add_argument("--stop-time", type=float, default=2.0, help="Stop sign wait duration (s).")
-    p.add_argument("--data-timeout", type=float, default=0.6, help="Data timeout threshold (s).")
+    p.add_argument("--stop-hold", type=float, default=3.0, help="Seconds to hold at a stop cue.")
+    p.add_argument("--stop-ignore", type=float, default=4.0, help="Seconds to ignore the cue after a stop (so the car can leave).")
+    p.add_argument("--data-timeout", type=float, default=0.7, help="Stop if camera/scan is older than this (s).")
     p.add_argument("--front-fov", type=float, default=30.0, help="Front FOV for LiDAR angle filtering (deg).")
-    p.add_argument("--stop-distance", type=float, default=0.25, help="Robot stops X meters from obstacles")
+    p.add_argument("--stop-distance", type=float, default=0.35, help="Robot stops X meters from obstacles")
+    p.add_argument("--slow-distance", type=float, default=0.8, help="Obstacle caution distance (m).")
 
     # Camera calibration
     p.add_argument("--fx", type=float, default=590.0, help="Focal length horizontal.")
     p.add_argument("--fy", type=float, default=590.0, help="Focal length vertical.")
 
     # Lane HSV Thresholds
-    p.add_argument("--lower", type=parse_triplet, default=(15, 70, 70), help="Yellow lower bound 1")
-    p.add_argument("--upper", type=parse_triplet, default=(35, 255, 255), help="Yellow upper bound 1")
-    p.add_argument("--lower2", type=parse_triplet, default=None, help="Optional yellow lower bound 2")
-    p.add_argument("--upper2", type=parse_triplet, default=None, help="Optional yellow upper bound 2")
+    p.add_argument("--lower", type=parse_triplet, default=(15, 70, 70), help="lane lower bound 1")
+    p.add_argument("--upper", type=parse_triplet, default=(35, 255, 255), help="lane upper bound 1")
+    p.add_argument("--lower2", type=parse_triplet, default=None, help="Optional lane lower bound 2")
+    p.add_argument("--upper2", type=parse_triplet, default=None, help="Optional lane upper bound 2")
     p.add_argument("--min-lane-area", type=float, default=200, help="Minimum area seen for lane detection")
 
-    # Stop Sign / Traffic Light HSV Thresholds
+    # Stop Sign HSV Thresholds
     p.add_argument("--stop-red-lower1", type=parse_triplet, default=(0, 70, 80))
     p.add_argument("--stop-red-upper1", type=parse_triplet, default=(10, 255, 255))
     p.add_argument("--stop-red-lower2", type=parse_triplet, default=(170, 70, 80))
     p.add_argument("--stop-red-upper2", type=parse_triplet, default=(179, 255, 255))
+
+    # Traffic Light HSV Thresholds
     p.add_argument("--light-red-lower1", type=parse_triplet, default=(0, 70, 80))
     p.add_argument("--light-red-upper1", type=parse_triplet, default=(10, 255, 255))
     p.add_argument("--light-red-lower2", type=parse_triplet, default=(170, 70, 80))
