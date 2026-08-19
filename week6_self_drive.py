@@ -1,87 +1,31 @@
 #!/usr/bin/env python3
-"""ROS 2 waypoint-following behavior for ELEC 555 Week 5.
+"""ROS 2 self-driving behavior for ELEC 555 Week 6.
 
-Run inside the sourced MentorPi ROS 2 container. The robot reads its pose from
-odometry and drives through a list of (x, y) waypoints with a bounded go-to-goal
-controller: turn toward the next waypoint, drive to it, advance when close, stop
-at the end. It optionally logs its trajectory so you can COMPARE the real run to
-the virtual-twin simulation (the Week 5 notebook / robot script run the SAME
-controller).
-
-SAFETY FIRST (same rules as Weeks 2-4)
---------
-* Default ``--mode report``: computes and PRINTS pose, target waypoint, and the
-  command it WOULD send, but publishes ZERO velocity. Nothing moves.
-* ``--mode drive`` publishes motion, every command clamped to small
-  ``--max-speed`` / ``--max-turn`` limits.
-* If no odometry arrives for ``--data-timeout`` seconds, the robot STOPS.
-* On Ctrl+C / shutdown / error, the control timer is CANCELLED and a zero
-  velocity is then published REPEATEDLY for about half a second before the node
-  exits. A single last-gasp publish right before ``destroy_node()`` is not
-  guaranteed to reach the chassis (the DDS writer may still be queuing it), so
-  the robot could keep running its last command. After Ctrl+C, watch the wheels
-  for a moment to confirm the stop.
-* When the last waypoint is reached the script holds zero for a second, saves the
-  trajectory log, and exits on its own -- no Ctrl+C required.
-
-ONE SOURCE OF TRUTH: ``--tolerance`` is the only thing that decides whether a
-waypoint counts as reached. If you extend this script (your own PID, your own
-"slow down near the goal" radius), read that same value rather than hardcoding a
-second number -- a controller that converges on one threshold while a different
-threshold decides when to advance can settle just outside the circle and never
-finish. Same for ``--max-speed``: it is the single cap, applied once.
-
-Begin in report mode with the wheels off the ground, roll the robot by hand and
-confirm the reported pose and target waypoint change sensibly, then drive in a
-clear, open area.
-
-WAYPOINTS are relative to WHERE THE ROBOT IS WHEN THE SCRIPT STARTS: the first
-odometry message is captured as the origin, so the robot always begins at (0, 0)
-facing +x, no matter what the raw odometry says. (Raw ``/odom`` is only near zero
-right after the chassis driver boots -- without this, a plan run after any prior
-driving would aim at wherever the driver happened to start. ``--absolute`` restores
-the raw odom-frame behavior.) Keep plans small for a lab (a ~1 m loop).
-
-Note the logged pose is what odometry BELIEVES, and odometry DRIFTS: the robot can
-believe it returned to (0, 0) while its true position is off by much more. That is
-why the tutorial has you tape-mark the start and measure the PHYSICAL end offset --
-the tape measure, not this log, is the real sim-to-real evidence.
-
-MentorPi defaults (per https://docs.hiwonder.com/projects/MentorPi/en/latest/):
-odometry ``/odom`` (nav_msgs/Odometry); chassis ``/controller/cmd_vel`` (Twist;
-+z left, -z right; <=0.6 m/s, <=2.0 rad/s). The robot's own SLAM/AMCL stack
-(slam_toolbox, ch. 6-7) gives a map-frame pose; this lab uses raw odometry.
+Lane following, stop sign detection, traffic light handling, and obstacle avoidance
+for the MentorPi chassis.
 """
 
 import argparse
 import math
 import sys
+
 try:
     import rclpy
     from rclpy.node import Node
     from rclpy.qos import qos_profile_sensor_data
-    from geometry_msgs.msg import Twist, PoseWithCovarianceStamped
+    from geometry_msgs.msg import Twist
     from sensor_msgs.msg import LaserScan, Image
 except ImportError as exc:
     print("Missing a ROS module. Run inside the sourced MentorPi ROS 2 container.", file=sys.stderr)
     print(f"Import error: {exc}", file=sys.stderr)
     raise SystemExit(2) from exc
 
-
 try:
     import cv2
     from cv_bridge import CvBridge
-
-except ImportError as exc:
-    print("NumPy / SciPy not installed. Install SciPy and NumPy inside the sourced MentorPi ROS2 container", file=sys.stderr)
-    print(f"Import error: {exc}", file=sys.stderr)
-    raise SystemExit(2) from exc
-
-try:
     import numpy as np
-    from scipy.spatial import KDTree
 except ImportError as exc:
-    print("NumPy / SciPy not installed. Install SciPy and NumPy inside the sourced MentorPi ROS2 container", file=sys.stderr)
+    print("OpenCV or NumPy not installed inside the sourced MentorPi ROS2 container.", file=sys.stderr)
     print(f"Import error: {exc}", file=sys.stderr)
     raise SystemExit(2) from exc
 
@@ -93,12 +37,8 @@ def clip(v, lo, hi):
     return max(lo, min(hi, v))
 
 
-def wrap(a):
-    return math.atan2(math.sin(a), math.cos(a))
-
 def parse_triplet(text):
     """Parse a command-line triplet such as 35,60,40."""
-
     try:
         values = tuple(int(part.strip()) for part in text.split(","))
     except ValueError as exc:
@@ -108,37 +48,20 @@ def parse_triplet(text):
     return values
 
 
-#Ideal PID values: kp=3.0 ki=0.0 kd=0.02
-class PIDController():
-    
+class PIDController:
     def __init__(self, kp: float, ki: float, kd: float, dt=0.02):
-
         self.kp = kp
         self.ki = ki
         self.kd = kd
 
         self.setpoint = 0.0
-
         self.integral = 0.0
         self.izone = 0.0
         self.int_min = -float('inf')
         self.int_max = float('inf')
-
         self.prev_error = 0.0
-
         self.tolerance = 0.0
-
         self.dt = dt
-
-    def set_izone(self, izone: float):
-        self.izone = izone
-
-    def set_integrator_range(self, int_min: float, int_max: float):
-            if (int_min > int_max):
-                int_min, int_max = int_max, int_min
-
-            self.int_max = int_max
-            self.int_min = int_min
 
     def set_setpoint(self, setpoint: float):
         self.setpoint = setpoint
@@ -166,52 +89,66 @@ class PIDController():
         dedt = (error - self.prev_error) / self.dt
 
         pid = self.kp * error + self.ki * self.integral + self.kd * dedt
-
         self.prev_error = error
 
         return pid
-
 
 
 class SelfDrive(Node):
     def __init__(self, args):
         super().__init__("week6_self_drive")
         self.args = args
-        self.stopping = False       # set by stop_robot(); blocks any further motion
-        self.finished = False       # plan complete -> main loop exits cleanly
+        self.stopping = False       # Set by stop_robot(); blocks motion on shutdown
+        self.finished = False       # Complete signal for main loop
 
         self.bridge = CvBridge()
 
-        self.frame = 0.0
-        self.frames_seen = 0.0
-        self.mask = 0.0
+        self.frames_seen = 0
+        self.lane_error_x = None    # Initialized as None until a lane is detected
 
-        self.lane_error_x = 0.0
-        self.stop_error = (0, 0)
-        self.light_error = (0, 0)
+        self.can_stop = True
+        self.last_stop_time = 0.0
+        self.stop_cooldown = 2.0
+        self.stop_dist = (None, None)
+        self.stop_error = (None, None)
+
+        self.light_dist = (None, None)
+        self.light_error = (None, None)
         self.light_color = "UNKNOWN"
-        self.forward_distance = float("inf") #Forward distance detected by LiDAR
-        self.last_data_time = 0.0
 
+        self.forward_distance = float("inf") # LiDAR front obstacle distance
+        self.last_data_time = self.get_clock().now()
+
+        self.stop_until = 0.0
+        self.stop_sign_stopped = False
+
+        self.stop_sign_w = 0.12       # meters
+        self.stop_sign_h = 0.12       # meters
+
+        self.traffic_light_w = 0.06   # meters
+        self.traffic_light_h = 0.06   # meters
+
+        # ROS 2 Subscriptions & Publishers
         self.cmd_pub = self.create_publisher(Twist, args.cmd_vel_topic, 10)
         self.create_subscription(Image, args.image_topic, self.on_image, qos_profile_sensor_data)
         self.create_subscription(LaserScan, args.scan_topic, self.on_scan, qos_profile_sensor_data)
 
+        # PID Controllers
         kp, ki, kd = self.args.lin_pid
-        self.speed_controller = PIDController(kp, ki, kd, dt=1/self.args.rate)
+        self.speed_controller = PIDController(kp, ki, kd, dt=1.0/self.args.rate)
         self.speed_controller.set_setpoint(0.0)
         self.speed_controller.set_tolerance(self.args.tolerance)
-        self.speed_setpoint = self.args.max_speed #Makes code for PID so much easier. Can just use setpoints
 
         kp, ki, kd = self.args.ang_pid
-        self.turn_controller = PIDController(kp, ki, kd, dt=1/self.args.rate)
+        self.turn_controller = PIDController(kp, ki, kd, dt=1.0/self.args.rate)
         self.turn_controller.set_setpoint(0.0)
         self.turn_controller.set_tolerance(math.radians(3))
-        self.turn_setpoint = 0.0
 
         self.get_logger().info(
-            f"MODE={args.mode.upper()}  waypoints={self.waypoints}  tol={args.tolerance:.2f} m  "
-            f"max_speed={args.max_speed:.2f}  max_turn={args.max_turn:.2f}  -> {args.cmd_vel_topic}"
+            f"MODE={args.mode.upper()} | "
+            f"lane HSV=({args.lower},{args.upper}) | "
+            f"max_speed={args.max_speed:.2f} m/s | "
+            f"max_turn={args.max_turn:.2f} rad/s"
         )
         if args.mode == "report":
             self.get_logger().info("REPORT mode: computing only, publishing ZERO velocity. Nothing moves.")
@@ -221,190 +158,197 @@ class SelfDrive(Node):
         self.timer = self.create_timer(1.0 / args.rate, self.control_step)
 
     def on_image(self, msg: Image):
-        frame = self.bridge.imgmsg_to_cv2(msg,desired_encoding="bgr8")
+        frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
         self.frames_seen += 1
         self.lane_error_x = self.lane_error(frame)
         
-        if error_coords := self.detect_stop_sign(frame):
-            if error_coords[0] is not None:  # Only checks the first element
-                self.stop_error = (error_coords[0], error_coords[1])
+        stop_data = self.detect_stop_sign(frame)
 
-        if error_coords := self.detect_traffic_light(frame):
-            if error_coords[0] is not None:  # Only checks the first element
-                self.light_error = (error_coords[0], error_coords[1])
-                self.light_color = error_coords[3]
+        if stop_data[0] is not None:
+            self.stop_dist = (stop_data[0], stop_data[1])
+            self.stop_error = (stop_data[2], stop_data[3])
+        else:
+            self.stop_dist = (None, None)
+            self.stop_error = (None, None)
 
+        light_data = self.detect_traffic_light(frame)
 
-                
+        if light_data[0] is not None:
+            self.light_dist = (light_data[0], light_data[1])
+            self.light_error = (light_data[2], light_data[3])
+            self.light_color = light_data[4]
+        else:
+            self.light_dist = (None, None)
+            self.light_error = (None, None)
+            self.light_color = "UNKNOWN"
+
     def lane_error(self, img):
         h, w = img.shape[:2]
-        hsv = cv2.cvtColor(cv2.GaussianBlur(img,(5,5),0), cv2.COLOR_BGR2HSV)
+        hsv = cv2.cvtColor(cv2.GaussianBlur(img, (5, 5), 0), cv2.COLOR_BGR2HSV)
         roi = hsv[int(h * 0.6):, :]
-        band = cv2.inRange(roi,np.array(self.args.lower), np.array(self.args.upper))
+        band = cv2.inRange(roi, np.array(self.args.lower), np.array(self.args.upper))
 
         if self.args.lower2 is not None and self.args.upper2 is not None:
             band2 = cv2.inRange(roi, np.array(self.args.lower2), np.array(self.args.upper2))
-
             band = cv2.bitwise_or(band, band2)
-        # binaryImage=True makes m00 the PIXEL COUNT. Without it m00 sums 0/255
-        # values, so a gate of 500 is really "2 pixels" -- and the car would happily
-        # steer at a speck of yellow on the floor. Count pixels, not brightness.
+
         M = cv2.moments(band, binaryImage=True)
-        if M["m00"] < self.args.min_lane_area: return None, None      # lane lost -> the car must stop
-        cx = M["m10"]/M["m00"]
-        return (cx - w/2)/(w/2)
+        if M["m00"] < self.args.min_lane_area:
+            return None
+        cx = M["m10"] / M["m00"]
+        return (cx - w / 2) / (w / 2)
 
     def detect_stop_sign(self, img):
-
         h, w = img.shape[:2]
 
-        #Tune on real robot
-        lower_red1 = (0, 100, 80)
-        upper_red1 = (10, 255, 255)
+        lower_red1 = self.args.stop_red_lower1
+        upper_red1 = self.args.stop_red_upper1
+        lower_red2 = self.args.stop_red_lower2
+        upper_red2 = self.args.stop_red_upper2
 
-        lower_red2 = (170, 100, 80)
-        upper_red2 = (179, 255, 255)
-
-        hsv = cv2.cvtColor(cv2.GaussianBlur(img,(5,5),0), cv2.COLOR_BGR2HSV)
+        hsv = cv2.cvtColor(cv2.GaussianBlur(img, (5, 5), 0), cv2.COLOR_BGR2HSV)
 
         red_mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
         red_mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
-
         red_mask = cv2.bitwise_or(red_mask1, red_mask2)
 
         contours, _ = cv2.findContours(red_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        #Detect if red contour is an octagon
         for contour in contours:
             area = cv2.contourArea(contour)
-            if area  < 500:
+            if area < 500:
                 continue
             perimeter = cv2.arcLength(contour, True)
             approx = cv2.approxPolyDP(contour, 0.04 * perimeter, True)
-
             num_corners = len(approx)
 
-            #Around 8 corners for an octagon. Done to reduce slight errors
             if 7 <= num_corners <= 9:
+                _, _, pixel_w, pixel_h = cv2.boundingRect(contour)
+                distance_w = (self.args.fx * self.stop_sign_w) / pixel_w
+                distance_h = (self.args.fy * self.stop_sign_h) / pixel_h
+
                 M = cv2.moments(contour)
-        
                 if M["m00"] != 0:
                     cx = int(M["m10"] / M["m00"])
                     cy = int(M["m01"] / M["m00"])
-                    return (cx - w/2)/(w/2), (cy - h/2)/(h/2)
+                    return distance_w, distance_h, (cx - w/2)/(w/2), (cy - h/2)/(h/2)
 
-        return None, None
+        return None, None, None, None
 
     def detect_traffic_light(self, img):
+        h, w = img.shape[:2]
 
-            h, w = img.shape[:2]
-    
-            #Tune on real robot
-            lower_red1 = (0, 100, 80)
-            upper_red1 = (10, 255, 255)
-    
-            lower_red2 = (170, 100, 80)
-            upper_red2 = (179, 255, 255)
+        lower_red1 = self.args.light_red_lower1
+        upper_red1 = self.args.light_red_upper1
+        lower_red2 = self.args.light_red_lower2
+        upper_red2 = self.args.light_red_upper2
 
-            lower_green = (0, 0, 0)
-            upper_green = (0, 0, 0)
+        lower_green = self.args.light_green_lower
+        upper_green = self.args.light_green_upper
 
-            # Convert to HSV format
-            hsv = cv2.cvtColor(cv2.GaussianBlur(img,(5,5),0), cv2.COLOR_BGR2HSV)
+        hsv = cv2.cvtColor(cv2.GaussianBlur(img, (5, 5), 0), cv2.COLOR_BGR2HSV)
 
-            #Create red and green masks then fise them
-            red_mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
-            red_mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
+        red_mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
+        red_mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
+        green_mask = cv2.inRange(hsv, lower_green, upper_green)
 
-            green_mask = cv2.inRange(hsv, lower_green, upper_green)
-            red_mask = cv2.bitwise_or(red_mask1, red_mask2)
+        red_mask = cv2.bitwise_or(red_mask1, red_mask2)
+        full_mask = cv2.bitwise_or(red_mask, green_mask)
 
-            full_mask = cv2.bitwise_or(red_mask, green_mask)
+        contours, _ = cv2.findContours(full_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-            # Get the contours
-            contours, _ = cv2.findContours(full_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-            #Detect if red contour is a circle or near-circular ellipse
-            for contour in contours:
-                area = cv2.contourArea(contour)
-                if area  < 50:
-                    continue
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area < 50:
+                continue
 
-                perimeter = cv2.arcLength(contour, True)
+            perimeter = cv2.arcLength(contour, True)
+            if perimeter == 0:
+                continue
+            circularity = (4 * np.pi * area) / (perimeter ** 2)
 
-                circularity = (4 * np.pi * area) / perimeter ** 2
-    
-                #If contour is around circular
-                if 0.85 <= circularity <= 1.2:
+            if 0.85 <= circularity <= 1.2:
+                contour_mask = np.zeros(img.shape[:2], dtype=np.uint8)
+                cv2.drawContours(contour_mask, [contour], -1, 255, -1)
 
-                    #Determine color of mask
-                    contour_mask = np.zeros(img.shape[:2], dtype=np.uint8)
-                    mean_hsv = cv2.mean(hsv, mask=contour_mask)
-                    mean_hue = mean_hsv[0]
+                mean_hsv = cv2.mean(hsv, mask=contour_mask)
+                mean_hue = mean_hsv[0]
 
-                    # Classify color based on Hue channel (OpenCV Hue is 0-179)
-                    # Red wraps around 0 and 180
-                    if mean_hue < 12 or mean_hue > 165:
-                        color = "RED"
-                    # Green is typically between 35 and 85
-                    elif 35 <= mean_hue <= 85:
-                        color = "GREEN"
-                    else:
-                        color = "UNKNOWN"
+                _, _, pixel_w, pixel_h = cv2.boundingRect(contour)
+                distance_w = (self.args.fx * self.traffic_light_w) / pixel_w
+                distance_h = (self.args.fy * self.traffic_light_h) / pixel_h
 
-                    # Get error_x and error_y
-                    M = cv2.moments(contour)
-            
-                    if M["m00"] != 0:
-                        cx = int(M["m10"] / M["m00"])
-                        cy = int(M["m01"] / M["m00"])
+                if mean_hue < 12 or mean_hue > 165:
+                    color = "RED"
+                elif 35 <= mean_hue <= 85:
+                    color = "GREEN"
+                else:
+                    color = "UNKNOWN"
 
-                        return (cx - w/2)/(w/2), (cy - h/2)/(h/2), color
-    
-            return None, None, None
-        
-    
+                M = cv2.moments(contour)
+                if M["m00"] != 0:
+                    cx = int(M["m10"] / M["m00"])
+                    cy = int(M["m01"] / M["m00"])
+                    return distance_w, distance_h, (cx - w/2)/(w/2), (cy - h/2)/(h/2), color
+
+        return None, None, None, None, None
+
     def on_scan(self, msg: LaserScan):
         ranges = np.asarray(msg.ranges, dtype=np.float32)
         n = ranges.size
         if n == 0:
             return
         angles = msg.angle_min + np.arange(n) * msg.angle_increment
-        # Keep only physically valid readings.
         valid = (
             np.isfinite(ranges)
             & (ranges >= msg.range_min)
             & (ranges <= msg.range_max)
         )
         half = math.radians(self.args.front_fov / 2.0)
-        # The LD19 publishes a full 360 deg scan; forward is angle 0 (REP-103
-        # x-forward). Wrap angles into [-pi, pi] so the forward window is around 0.
         wrapped = np.arctan2(np.sin(angles), np.cos(angles))
         front = valid & (np.abs(wrapped) <= half)
 
         self.forward_distance = float(np.min(ranges[front])) if np.any(front) else math.inf
         self.last_data_time = self.get_clock().now()
-        
 
     def control_step(self):
-        # No lane
+        now = self.get_clock().now().nanoseconds / 1e9
+
+        # LiDAR check
+        if self.forward_distance <= self.args.stop_distance:
+            self.publish(Twist(), "Obstacle in the way")
+            return
+
+        # Traffic light check
+        if self.light_color == "RED" and self.light_dist[0] is not None and self.light_dist[0] <= self.args.stop_distance:
+            self.publish(Twist(), "Red Light")
+            return
+
+        if now - self.last_stop_time >= self.stop_cooldown and not self.can_stop:
+            self.can_stop = True
+
+        # Stop sign check
+        if self.can_stop:
+            if self.stop_dist[0] is not None and self.stop_dist[0] <= self.args.stop_distance and not self.stop_sign_stopped:
+                self.stop_sign_stopped = True
+                self.last_stop_time = now
+                self.stop_until = now + self.args.stop_time
+
+            if self.stop_sign_stopped:
+                if now < self.stop_until:
+                    self.publish(Twist(), "Stop Sign")
+                    return
+                self.stop_sign_stopped = False
+                self.stop_dist = (None, None)
+                self.can_stop = False
+
+        # Lane tracking check
         if self.lane_error_x is None:
             self.publish(Twist(), "Lane Lost")
             return
-        
-        # LiDAR safety
-        if self.front < self.args.stop_distance:
-            self.speed_setpoint = 0.0
-        else:
-            self.speed_setpoint = self.args.max_speed
-        
-        self.turn_setpoint = self.lane_error_x
 
-        # Steering
-        turn = clip(self.turn_controller.calculate(self.turn_setpoint), -self.args.max_turn, self.args.max_turn)
-
-        # Forward speed
-        speed = clip(self.turn_controller.calculate(self.turn_setpoint), -self.args.max_turn, self.args.max_turn)
+        turn = clip(self.turn_controller.calculate(-self.lane_error_x),-self.args.max_turn,self.args.max_turn)
+        speed = clip(self.speed_controller.calculate(self.args.stop_distance - clip(self.forward_distance, 0, 25)), -self.args.max_speed, self.args.max_speed)
 
         cmd = Twist()
         cmd.linear.x = speed
@@ -413,26 +357,30 @@ class SelfDrive(Node):
         self.publish(cmd, "Lane Following")
 
     def publish(self, twist: Twist, note: str):
-        self.get_logger().info(f"{note} | v={twist.linear.x:+.3f} w={twist.angular.z:+.3f}")
+        lane_log = "none" if self.lane_error_x is None else f"{self.lane_error_x:+.3f}"
+
+        stop_detected = self.stop_dist[0] is not None
+        stop_log = f"{self.stop_dist[0]:.2f}m" if stop_detected else "none"
+
+        light_detected = self.light_dist[0] is not None
+        light_log = f"{self.light_color} {self.light_dist[0]:.2f}m" if light_detected else "none"
+
+        self.get_logger().info(
+            f"{note} | "
+            f"lane={lane_log} | "
+            f"stop_cue={stop_detected} | "
+            f"stop_dist={stop_log} | "
+            f"light={light_log} | "
+            f"lidar_forward_dist={self.forward_distance:.2f}m | "
+            f"v={twist.linear.x:+.3f} w={twist.angular.z:+.3f}"
+        )
+
         if self.args.mode == "drive" and not self.stopping:
             self.cmd_pub.publish(twist)
         else:
             self.cmd_pub.publish(Twist())
 
-    
     def stop_robot(self):
-        # A single publish() here is not a reliable stop: destroy_node() and
-        # rclpy.shutdown() can run before the DDS writer has actually flushed the
-        # message, so the chassis never sees it and keeps executing its last
-        # command. Publish zero repeatedly, spinning briefly between sends, so
-        # the stop has multiple chances to get out before the node is torn down.
-        #
-        # Cancel the control timer FIRST. Spinning is what gives the zero command
-        # time to go out, but spin_once() also runs whatever callback is ready --
-        # and a pending control_step() would publish a NON-zero command right
-        # after our zero, leaving "keep driving" as the last thing the chassis
-        # heard. Stopping means stopping the thing that commands motion, then
-        # sending zero, in that order.
         self.stopping = True
         try:
             self.timer.cancel()
@@ -440,80 +388,89 @@ class SelfDrive(Node):
             pass
         stop = Twist()
         for _ in range(10):
-            # Guard each attempt separately: spin_once() runs other callbacks,
-            # and one of them raising must not cancel the remaining stop
-            # publishes -- that would quietly turn this back into a one-shot
-            # stop, which is the bug this loop exists to prevent.
             try:
                 self.cmd_pub.publish(stop)
                 rclpy.spin_once(self, timeout_sec=0.05)
             except Exception:
                 pass
 
+
 def build_parser():
     p = argparse.ArgumentParser(description="Week 6 self drive capstone")
- 
+    
+    # System execution flags
+    p.add_argument("--mode", choices=("report", "drive"), default="report", help="report = compute/print only; drive = move robot.")
     p.add_argument("--image-topic", default="/ascamera/camera_publisher/rgb0/image", help="RGB image topic.")
-    p.add_argument("--scan-topic", default="/scan_raw", help="LD19 LaserScan topic (try /scan if /scan_raw is absent; confirm with ros2 topic list).")
-    p.add_argument("--cmd-vel-topic", default="/controller/cmd_vel", help="Twist topic the MentorPi chassis listens to (verify with ros2 topic list).")
-    p.add_argument("--tolerance", type=float, default=0.12, help="Distance to count a waypoint as reached (m).")
-    p.add_argument("--max-speed", type=float, default=0.15, help=f"Bounded forward speed (m/s); hard-capped at {MENTORPI_MAX_SPEED}.")
-    p.add_argument("--max-turn", type=float, default=0.8, help=f"Bounded turn rate (rad/s); hard-capped at {MENTORPI_MAX_TURN}.")
+    p.add_argument("--scan-topic", default="/scan_raw", help="LD19 LaserScan topic.")
+    p.add_argument("--cmd-vel-topic", default="/controller/cmd_vel", help="Twist command topic.")
+    
+    # Motion & PID settings
+    p.add_argument("--tolerance", type=float, default=0.12, help="Distance tolerance (m).")
+    p.add_argument("--max-speed", type=float, default=0.15, help=f"Bounded forward speed (m/s); capped at {MENTORPI_MAX_SPEED}.")
+    p.add_argument("--max-turn", type=float, default=0.8, help=f"Bounded turn rate (rad/s); capped at {MENTORPI_MAX_TURN}.")
     p.add_argument("--ang-pid", type=float, default=[1.0, 0.0, 0.0], nargs=3, help="PID error to turn rate.")
     p.add_argument("--lin-pid", type=float, default=[3.0, 0.0, 0.02], nargs=3, help="PID error to forward speed.")
-    p.add_argument("--data-timeout", type=float, default=0.6, help="Stop if no odometry for this many seconds.")
     p.add_argument("--rate", type=float, default=10.0, help="Control loop rate (Hz).")
-    p.add_argument("--color-name", default="red", help="red, green, blue, or a custom label")
-    p.add_argument("--lower", type=parse_triplet, help="first lower threshold triplet")
-    p.add_argument("--upper", type=parse_triplet, help="first upper threshold triplet")
-    p.add_argument("--lower2", type=parse_triplet, help="optional second lower threshold triplet")
-    p.add_argument("--upper2", type=parse_triplet, help="optional second upper threshold triplet")
-    p.add_argument("--min-line-area", type=float, default=200, help="Minimum area seen for the lane")
-    p.add_argument("--front-fov", type=float, default=30, help="Front FOV for lidar to look ahead")
+    p.add_argument("--stop-time", type=float, default=2.0, help="Stop sign wait duration (s).")
+    p.add_argument("--data-timeout", type=float, default=0.6, help="Data timeout threshold (s).")
+    p.add_argument("--front-fov", type=float, default=30.0, help="Front FOV for LiDAR angle filtering (deg).")
+    p.add_argument("--stop-distance", type=float, default=0.25, help="Robot stops X meters from obstacles")
+
+    # Camera calibration
+    p.add_argument("--fx", type=float, default=590.0, help="Focal length horizontal.")
+    p.add_argument("--fy", type=float, default=590.0, help="Focal length vertical.")
+
+    # Lane HSV Thresholds
+    p.add_argument("--lower", type=parse_triplet, default=(15, 70, 70), help="Yellow lower bound 1")
+    p.add_argument("--upper", type=parse_triplet, default=(35, 255, 255), help="Yellow upper bound 1")
+    p.add_argument("--lower2", type=parse_triplet, default=None, help="Optional yellow lower bound 2")
+    p.add_argument("--upper2", type=parse_triplet, default=None, help="Optional yellow upper bound 2")
+    p.add_argument("--min-lane-area", type=float, default=200, help="Minimum area seen for lane detection")
+
+    # Stop Sign / Traffic Light HSV Thresholds
+    p.add_argument("--stop-red-lower1", type=parse_triplet, default=(0, 70, 80))
+    p.add_argument("--stop-red-upper1", type=parse_triplet, default=(10, 255, 255))
+    p.add_argument("--stop-red-lower2", type=parse_triplet, default=(170, 70, 80))
+    p.add_argument("--stop-red-upper2", type=parse_triplet, default=(179, 255, 255))
+    p.add_argument("--light-red-lower1", type=parse_triplet, default=(0, 70, 80))
+    p.add_argument("--light-red-upper1", type=parse_triplet, default=(10, 255, 255))
+    p.add_argument("--light-red-lower2", type=parse_triplet, default=(170, 70, 80))
+    p.add_argument("--light-red-upper2", type=parse_triplet, default=(179, 255, 255))
+    p.add_argument("--light-green-lower", type=parse_triplet, default=(45, 70, 70))
+    p.add_argument("--light-green-upper", type=parse_triplet, default=(85, 255, 255))
+
     return p
 
 
 def main():
     args = build_parser().parse_args()
-    if not args.waypoints.strip():
-        print("Provide at least one waypoint.", file=sys.stderr)
-        raise SystemExit(2)
+
+    # Cap speed & turn rate bounds
     if args.max_speed > MENTORPI_MAX_SPEED:
-        print(f"--max-speed {args.max_speed} exceeds the MentorPi limit; capping to {MENTORPI_MAX_SPEED} m/s.", file=sys.stderr)
+        print(f"--max-speed {args.max_speed} exceeds limit; capping to {MENTORPI_MAX_SPEED} m/s.", file=sys.stderr)
         args.max_speed = MENTORPI_MAX_SPEED
     if args.max_turn > MENTORPI_MAX_TURN:
-        print(f"--max-turn {args.max_turn} exceeds the MentorPi limit; capping to {MENTORPI_MAX_TURN} rad/s.", file=sys.stderr)
+        print(f"--max-turn {args.max_turn} exceeds limit; capping to {MENTORPI_MAX_TURN} rad/s.", file=sys.stderr)
         args.max_turn = MENTORPI_MAX_TURN
 
-    # The controller only re-checks "am I there yet?" once per control tick, so
-    # between checks the robot travels max_speed/rate metres. If the tolerance is
-    # not comfortably bigger than that step, the robot can jump straight over the
-    # acceptance circle every tick, never register the waypoint as reached, and
-    # orbit it forever. Same idea as Week 4's inference latency: the loop rate,
-    # not the sensor, sets how finely the robot can act.
+    # Safety step warning check
     step = args.max_speed / args.rate
     if args.tolerance < 2.0 * step:
         print(f"WARNING: --tolerance {args.tolerance:.3f} m is small next to the "
-              f"{step:.3f} m the robot covers per control tick "
-              f"({args.max_speed:.2f} m/s / {args.rate:.0f} Hz). The robot may "
-              f"circle a waypoint instead of reaching it. Use at least "
-              f"{2.0 * step:.2f} m, or lower --max-speed.", file=sys.stderr)
+              f"{step:.3f} m step covered per control tick. Use at least "
+              f"{2.0 * step:.2f} m or lower --max-speed.", file=sys.stderr)
 
     rclpy.init()
     node = SelfDrive(args)
     try:
-        # Not rclpy.spin(): this loop lets the node end the run itself once the
-        # plan is complete, so the trajectory log is saved without waiting for a
-        # Ctrl+C. Ctrl+C still works at any point.
         while rclpy.ok() and not node.finished:
             rclpy.spin_once(node, timeout_sec=0.1)
         if node.finished:
-            node.get_logger().info("plan complete -> stopping")
+            node.get_logger().info("Plan complete -> stopping")
     except KeyboardInterrupt:
         pass
     finally:
         node.stop_robot()
-        node.save_log()
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
