@@ -160,6 +160,7 @@ class SelfDrive(Node):
         self.traffic_light_h = 0.06
 
         self.cmd_pub = self.create_publisher(Twist, args.cmd_vel_topic, 10)
+        self.image_pub = self.create_publisher(Image, "week6_self_driving/lane_mask", 10)
         self.create_subscription(Image, args.image_topic, self.on_image, qos_profile_sensor_data)
         self.create_subscription(LaserScan, args.scan_topic, self.on_scan, qos_profile_sensor_data)
 
@@ -223,14 +224,14 @@ class SelfDrive(Node):
         h, w = img.shape[:2]
         
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-        roi = hsv[int(h * 0.55):, :]
+        roi = hsv[int(h * (1 - self.args.lane_lookahead)):, :]
         
         band = cv2.inRange(roi, np.array(self.args.lower), np.array(self.args.upper))
         if self.args.lower2 is not None and self.args.upper2 is not None:
             band2 = cv2.inRange(roi, np.array(self.args.lower2), np.array(self.args.upper2))
             band = cv2.bitwise_or(band, band2)
 
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
         band = cv2.morphologyEx(band, cv2.MORPH_OPEN, kernel)
         band = cv2.morphologyEx(band, cv2.MORPH_CLOSE, kernel)
 
@@ -239,6 +240,11 @@ class SelfDrive(Node):
             return None
             
         cx = M["m10"] / M["m00"]
+
+        # Publish mask for debugging
+        mask_color = cv2.cvtColor(band, cv2.COLOR_GRAY2BGR)
+        self.image_pub.publish(self.bridge.cv2_to_imgmsg(mask_color, encoding="bgr8"))
+        
         return (cx - w / 2.0) / (w / 2.0)
 
     def detect_stop_sign(self, img):
@@ -354,23 +360,6 @@ class SelfDrive(Node):
         self.forward_distance = float(np.min(ranges[front])) if np.any(front) else math.inf
         self.last_scan = self.get_clock().now()
 
-    def search_for_lane(self, twist):
-        if self.search_start_time is None:
-            self.search_start_time = self.get_clock().now()
-            self.search_direction = 1
-        
-        elapsed = (self.get_clock().now() - self.search_start_time).nanoseconds / 1e9
-        
-        if elapsed > 2.0:
-            self.search_direction *= -1
-            self.search_start_time = self.get_clock().now()
-        
-        twist.angular.z = self.search_direction * 0.6
-        twist.linear.x = 0.0
-        
-        self.publish(twist, "SEARCHING", f"dir={self.search_direction}")
-        return
-
     def control_step(self):
         now = self.get_clock().now()
         twist = Twist()
@@ -421,7 +410,7 @@ class SelfDrive(Node):
                 self.publish(twist, "PREDICTING", f"loss={self.consecutive_losses}")
                 return
             
-            return self.search_for_lane(twist)
+            return
         
         self.consecutive_losses = 0
         self.lane_history.append(self.lane_error_x)
@@ -518,6 +507,7 @@ def build_parser():
     p.add_argument("--front-fov", type=float, default=30.0, help="Front FOV for LiDAR angle filtering (deg).")
     p.add_argument("--stop-distance", type=float, default=0.35, help="Robot stops X meters from obstacles")
     p.add_argument("--slow-distance", type=float, default=0.8, help="Obstacle caution distance (m).")
+    p.add_argument("--lane-lookahead", type=float, default=0.45, help="Percentage of the image to cut off when looking for lane. 50% = cut off top half")
 
     p.add_argument("--fx", type=float, default=590.0, help="Focal length horizontal.")
     p.add_argument("--fy", type=float, default=590.0, help="Focal length vertical.")
