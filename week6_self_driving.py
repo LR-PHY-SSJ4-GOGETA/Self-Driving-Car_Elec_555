@@ -160,7 +160,7 @@ class SelfDrive(Node):
         self.traffic_light_h = 0.06
 
         self.cmd_pub = self.create_publisher(Twist, args.cmd_vel_topic, 10)
-        self.image_pub = self.create_publisher(Image, "week6_self_driving/lane_mask", 10)
+        self.mask_pub = self.create_publisher(Image, "week6_self_driving/total_mask", 10)
         self.create_subscription(Image, args.image_topic, self.on_image, qos_profile_sensor_data)
         self.create_subscription(LaserScan, args.scan_topic, self.on_scan, qos_profile_sensor_data)
 
@@ -198,7 +198,7 @@ class SelfDrive(Node):
     def on_image(self, msg: Image):
         frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
         self.frames_seen += 1
-        self.lane_error_x = self.lane_error(frame)
+        self.lane_error_x, lane_mask = self.lane_error(frame)
         
         stop_data = self.detect_stop_sign(frame)
         if stop_data[0] is not None:
@@ -218,15 +218,29 @@ class SelfDrive(Node):
             self.light_error = (None, None)
             self.light_color = "UNKNOWN"
 
+        stop_mask = stop_data[4] if stop_data[4] is not None else np.zeros(frame.shape[:2], dtype=np.uint8)
+        light_mask = light_data[5] if light_data[5] is not None else np.zeros(frame.shape[:2], dtype=np.uint8)
+        lane_mask = lane_mask if lane_mask is not None else np.zeros(frame.shape[:2], dtype=np.uint8)
+
+        total_mask = cv2.bitwise_or(stop_mask, light_mask)
+        total_mask = cv2.bitwise_or(total_mask, lane_mask)
+
+        final_mask = cv2.cvtColor(total_mask, cv2.COLOR_GRAY2BGR) 
+
+        self.mask_pub.publish(self.bridge.cv2_to_imgmsg(final_mask))
+
         self.last_image = self.get_clock().now()
 
     def lane_error(self, img):
         h, w = img.shape[:2]
         
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-        roi = hsv[int(h * (1 - self.args.lane_lookahead)):, :]
+        # How much the ROI cuts from the image. Used to focus on the track
+        roi_start = int(h * (1 - self.args.lane_lookahead))
+        roi = hsv[roi_start:, :]
         
         band = cv2.inRange(roi, np.array(self.args.lower), np.array(self.args.upper))
+
         if self.args.lower2 is not None and self.args.upper2 is not None:
             band2 = cv2.inRange(roi, np.array(self.args.lower2), np.array(self.args.upper2))
             band = cv2.bitwise_or(band, band2)
@@ -237,15 +251,15 @@ class SelfDrive(Node):
 
         M = cv2.moments(band, binaryImage=True)
         if M["m00"] < self.args.min_lane_area:
-            return None
+            return None, None
             
         cx = M["m10"] / M["m00"]
 
-        # Publish mask for debugging
-        mask_color = cv2.cvtColor(band, cv2.COLOR_GRAY2BGR)
-        self.image_pub.publish(self.bridge.cv2_to_imgmsg(mask_color, encoding="bgr8"))
+        # Full-size image with the band. Only used for publish and debugging
+        full_band = np.zeros((h, w), dtype=np.uint8)
+        full_band[roi_start:, :] = band
         
-        return (cx - w / 2.0) / (w / 2.0)
+        return (cx - w / 2.0) / (w / 2.0), full_band
 
     def detect_stop_sign(self, img):
         h, w = img.shape[:2]
@@ -280,9 +294,9 @@ class SelfDrive(Node):
                 if M["m00"] != 0:
                     cx = int(M["m10"] / M["m00"])
                     cy = int(M["m01"] / M["m00"])
-                    return distance_w, distance_h, (cx - w/2)/(w/2), (cy - h/2)/(h/2)
+                    return distance_w, distance_h, (cx - w/2)/(w/2), (cy - h/2)/(h/2), red_mask
 
-        return None, None, None, None
+        return None, None, None, None, None
 
     def detect_traffic_light(self, img):
         h, w = img.shape[:2]
@@ -338,9 +352,9 @@ class SelfDrive(Node):
                 if M["m00"] != 0:
                     cx = int(M["m10"] / M["m00"])
                     cy = int(M["m01"] / M["m00"])
-                    return distance_w, distance_h, (cx - w/2)/(w/2), (cy - h/2)/(h/2), color
+                    return distance_w, distance_h, (cx - w/2)/(w/2), (cy - h/2)/(h/2), color, red_mask
 
-        return None, None, None, None, None
+        return None, None, None, None, None, None
 
     def on_scan(self, msg: LaserScan):
         ranges = np.asarray(msg.ranges, dtype=np.float32)
@@ -407,7 +421,7 @@ class SelfDrive(Node):
                 speed = self.args.max_speed * 0.15
                 twist.linear.x = speed
                 twist.angular.z = turn
-                self.publish(twist, "PREDICTING", f"loss={self.consecutive_losses}")
+                self.publish(twist, "RECOVERY", f"loss={self.consecutive_losses}")
                 return
             
             return
